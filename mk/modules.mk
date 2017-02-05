@@ -125,6 +125,12 @@ USE_ISAC := $(shell [ -f $(SYSROOT)/include/isac.h ] || \
 USE_MPG123  := $(shell [ -f $(SYSROOT)/include/mpg123.h ] || \
 	[ -f $(SYSROOT)/local/include/mpg123.h ] || \
 	[ -f $(SYSROOT_ALT)/include/mpg123.h ] && echo "yes")
+USE_MQTT := := $(shell [ -f $(SYSROOT)/include/MQTTClient.h ] || \
+	[ -f $(SYSROOT)/local/include/MQTTClient.h ] || \
+	[ -f $(SYSROOT_ALT)/include/MQTTClient.h ] || \
+	[ -f $(SYSROOT)/include/cjson/cJSON.h ] || \
+	[ -f $(SYSROOT)/local/include/cjson/cJSON.h ] || \
+	[ -f $(SYSROOT_ALT)/include/cjson/cJSON.h ] && echo "yes")
 USE_OPUS := $(shell [ -f $(SYSROOT)/include/opus/opus.h ] || \
 	[ -f $(SYSROOT_ALT)/include/opus/opus.h ] || \
 	[ -f $(SYSROOT)/local/include/opus/opus.h ] && echo "yes")
@@ -258,7 +264,7 @@ endif
 
 MODULES   += $(EXTRA_MODULES)
 MODULES   += stun turn ice natbd auloop presence
-MODULES   += menu contact vumeter mwi account natpmp httpd
+MODULES   += contact vumeter mwi account natpmp httpd
 MODULES   += srtp
 MODULES   += uuid
 MODULES   += debug_cmd
@@ -359,6 +365,11 @@ MODULES   += isac
 endif
 ifneq ($(USE_L16),)
 MODULES   += l16
+endif
+ifneq ($(USE_MQTT),)
+MODULES   += mqtt
+else
+MODULES   += menu
 endif
 ifneq ($(USE_OPENGL),)
 MODULES   += opengl
