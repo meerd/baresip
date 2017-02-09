@@ -29,12 +29,15 @@ enum statmode {
 };
 
 enum module_events {
-    MQ_POPUP,
     MQ_CONNECT,
-    MQ_QUIT,
     MQ_ANSWER,
     MQ_HANGUP,
-    MQ_SELECT_UA,
+    MQ_MUTE,
+    MQ_UNMUTE,
+    MQ_HOLD,
+    MQ_RESUME, 
+    MQ_CALL_STATUS,
+    MQ_REGISTRATION_STATUS
 };
 
 static uint64_t start_ticks;          /**< Ticks when app started         */
@@ -58,31 +61,6 @@ static struct {
     MQTTClient_connectOptions connection_options;
 } mqtt;
 
-
-static int  menu_set_incall(bool incall);
-static void update_callstatus(void);
-static void alert_stop(void);
-static int switch_audio_source(struct re_printf *pf, void *arg);
-static int switch_audio_player(struct re_printf *pf, void *arg);
-
-static int vprintf_null(const char *p, size_t size, void *arg)
-{
-    (void)p;
-    (void)size;
-    (void)arg;
-    return 0;
-}
-
-
-static struct re_printf pf_null = {vprintf_null, 0};
-
-static void redial_reset(void)
-{
-    tmr_cancel(&mqtt.tmr_redial);
-    mqtt.current_attempts = 0;
-}
-
-
 static const char *translate_errorcode(uint16_t scode)
 {
     switch (scode) {
@@ -93,7 +71,6 @@ static const char *translate_errorcode(uint16_t scode)
     default:  return "error.wav";
     }
 }
-
 
 static void check_registrations(void)
 {
@@ -133,376 +110,6 @@ static struct ua *uag_cur(void)
     return uag_current();
 }
 
-
-/* Return TRUE if there are any active calls for any UAs */
-static bool have_active_calls(void)
-{
-    struct le *le;
-
-    for (le = list_head(uag_list()); le; le = le->next) {
-
-        struct ua *ua = le->data;
-
-        if (ua_call(ua))
-            return true;
-    }
-
-    return false;
-}
-
-
-/**
- * Print the SIP Registration for all User-Agents
- *
- * @param pf     Print handler for debug output
- * @param unused Unused parameter
- *
- * @return 0 if success, otherwise errorcode
- */
-static int ua_print_reg_status(struct re_printf *pf, void *unused)
-{
-    struct le *le;
-    int err;
-
-    (void)unused;
-
-    err = re_hprintf(pf, "\n--- Useragents: %u ---\n",
-             list_count(uag_list()));
-
-    for (le = list_head(uag_list()); le && !err; le = le->next) {
-        const struct ua *ua = le->data;
-
-        err  = re_hprintf(pf, "%s ", ua == uag_cur() ? ">" : " ");
-        err |= ua_print_status(pf, ua);
-    }
-
-    err |= re_hprintf(pf, "\n");
-
-    return err;
-}
-
-
-/**
- * Print the current SIP Call status for the current User-Agent
- *
- * @param pf     Print handler for debug output
- * @param unused Unused parameter
- *
- * @return 0 if success, otherwise errorcode
- */
-static int ua_print_call_status(struct re_printf *pf, void *unused)
-{
-    struct call *call;
-    int err;
-
-    (void)unused;
-
-    call = ua_call(uag_cur());
-    if (call) {
-        err  = re_hprintf(pf, "\n%H\n", call_debug, call);
-    }
-    else {
-        err  = re_hprintf(pf, "\n(no active calls)\n");
-    }
-
-    return err;
-}
-
-
-static int dial_handler(struct re_printf *pf, void *arg)
-{
-    const struct cmd_arg *carg = arg;
-    int err = 0;
-
-    (void)pf;
-
-    if (str_isset(carg->prm)) {
-        mbuf_rewind(dialbuf);
-        (void)mbuf_write_str(dialbuf, carg->prm);
-        printf("dialbuf parameter: %s\n", carg->prm);
-        err = ua_connect(uag_cur(), NULL, NULL,
-                 carg->prm, NULL, VIDMODE_ON);
-    }
-    else if (dialbuf->end > 0) {
-        char *uri;
-
-        dialbuf->pos = 0;
-        err = mbuf_strdup(dialbuf, &uri, dialbuf->end);
-        if (err)
-            return err;
-
-        err = ua_connect(uag_cur(), NULL, NULL, uri, NULL, VIDMODE_ON);
-
-        mem_deref(uri);
-    }
-
-    if (err) {
-        warning("menu: ua_connect failed: %m\n", err);
-    }
-
-    return err;
-}
-
-
-static void options_resp_handler(int err, const struct sip_msg *msg, void *arg)
-{
-    (void)arg;
-
-    if (err) {
-        warning("options reply error: %m\n", err);
-        return;
-    }
-
-    if (msg->scode < 200)
-        return;
-
-    if (msg->scode < 300) {
-
-        mbuf_set_pos(msg->mb, 0);
-        info("----- OPTIONS of %r -----\n%b",
-             &(msg->to.auri), mbuf_buf(msg->mb),
-             mbuf_get_left(msg->mb));
-        return;
-    }
-
-    info("%r: OPTIONS failed: %u %r\n", &(msg->to.auri),
-         msg->scode, &msg->reason);
-}
-
-
-static int options_command(struct re_printf *pf, void *arg)
-{
-    const struct cmd_arg *carg = arg;
-    int err = 0;
-
-    (void)pf;
-
-    if (str_isset(carg->prm)) {
-
-        mbuf_rewind(dialbuf);
-        (void)mbuf_write_str(dialbuf, carg->prm);
-
-        err = ua_options_send(uag_cur(), carg->prm,
-                      options_resp_handler, NULL);
-    }
-    else if (dialbuf->end > 0) {
-
-        char *uri;
-
-        dialbuf->pos = 0;
-        err = mbuf_strdup(dialbuf, &uri, dialbuf->end);
-        if (err)
-            return err;
-
-        err = ua_options_send(uag_cur(), uri,
-                      options_resp_handler, NULL);
-
-        mem_deref(uri);
-    }
-
-    if (err) {
-        warning("menu: ua_options failed: %m\n", err);
-    }
-
-    return err;
-}
-
-
-static int cmd_answer(struct re_printf *pf, void *unused)
-{
-    struct ua *ua = uag_cur();
-    int err;
-    (void)unused;
-
-    err = re_hprintf(pf, "%s: Answering incoming call\n", ua_aor(ua));
-
-    /* Stop any ongoing ring-tones */
-    mqtt.play = mem_deref(mqtt.play);
-
-    ua_hold_answer(ua, NULL);
-
-    return err;
-}
-
-
-int cmd_hangup(struct re_printf *pf, void *unused)
-{
-    (void)pf;
-    (void)unused;
-
-    /* Stop any ongoing ring-tones */
-    mqtt.play = mem_deref(mqtt.play);
-    alert_stop();
-
-    ua_hangup(uag_cur(), NULL, 0, NULL);
-
-    /* note: must be called after ua_hangup() */
-    menu_set_incall(have_active_calls());
-
-    return 0;
-}
-
-
-static int create_ua(struct re_printf *pf, void *arg)
-{
-    const struct cmd_arg *carg = arg;
-    struct le *le;
-    int err = 0;
-
-    (void)pf;
-
-     if (str_isset(carg->prm)) {
-
-        mbuf_rewind(dialbuf);
-        (void)mbuf_write_str(dialbuf, carg->prm);
-
-        (void)re_hprintf(pf, "Creating UA for %s ...\n", carg->prm);
-        err = ua_alloc(NULL, carg->prm);
-
-
-    }
-    else if (dialbuf->end > 0) {
-
-        char *uri;
-
-        dialbuf->pos = 0;
-        err = mbuf_strdup(dialbuf, &uri, dialbuf->end);
-        if (err)
-            return err;
-
-        (void)re_hprintf(pf, "Creating UA for %s ...\n", uri);
-        err |=  ua_alloc(NULL, uri);
-
-        mem_deref(uri);
-    }
-
-    for (le = list_head(uag_list()); le && !err; le = le->next) {
-        const struct ua *ua = le->data;
-
-        err  = re_hprintf(pf, "%s ", ua == uag_cur() ? ">" : " ");
-        err |= ua_print_status(pf, ua);
-    }
-
-    err |= re_hprintf(pf, "\n");
-
-
-    if (err) {
-        (void)re_hprintf(pf, "menu: create_ua failed: %m\n", err);
-    }
-
-
-    return err;
-}
-
-
-static int cmd_ua_next(struct re_printf *pf, void *unused)
-{
-    (void)pf;
-    (void)unused;
-
-    if (!le_cur)
-        le_cur = list_head(uag_list());
-    if (!le_cur)
-        return 0;
-
-    le_cur = le_cur->next ? le_cur->next : list_head(uag_list());
-
-    (void)re_fprintf(stderr, "ua: %s\n", ua_aor(list_ledata(le_cur)));
-
-    uag_current_set(list_ledata(le_cur));
-
-    update_callstatus();
-
-    return 0;
-}
-
-
-static int print_commands(struct re_printf *pf, void *unused)
-{
-    (void)unused;
-    return cmd_print(pf, baresip_commands());
-}
-
-
-static int cmd_print_calls(struct re_printf *pf, void *unused)
-{
-    (void)unused;
-    return ua_print_calls(pf, uag_cur());
-}
-
-
-static const struct cmd cmdv[] = {
-
-{"accept",    'a',        0, "Accept incoming call",    cmd_answer           },
-{"hangup",    'b',        0, "Hangup call",             cmd_hangup           },
-{"callstat",  'c',        0, "Call status",             ua_print_call_status },
-{"dial",      'd',  CMD_PRM, "Dial",                    dial_handler         },
-{"help",      'h',        0, "Help menu",               print_commands       },
-{"listcalls", 'l',        0, "List active calls",       cmd_print_calls      },
-{"options",   'o',  CMD_PRM, "Options",                 options_command      },
-{"reginfo",   'r',        0, "Registration info",       ua_print_reg_status  },
-{NULL,        KEYCODE_ESC,0, "Hangup call",             cmd_hangup           },
-{"uanext",    'T',        0, "Toggle UAs",              cmd_ua_next          },
-{"uanew",     0,    CMD_PRM, "Create User-Agent",       create_ua            },
-{"ausrc",     0,   CMD_IPRM, "Switch audio source",     switch_audio_source  },
-{"auplay",    0,   CMD_IPRM, "Switch audio player",     switch_audio_player  },
-
-};
-
-static const struct cmd dialcmdv[] = {
-/* Numeric keypad inputs: */
-{NULL, '#', CMD_PRM, NULL,   dial_handler },
-{NULL, '*', CMD_PRM, NULL,   dial_handler },
-{NULL, '0', CMD_PRM, NULL,   dial_handler },
-{NULL, '1', CMD_PRM, NULL,   dial_handler },
-{NULL, '2', CMD_PRM, NULL,   dial_handler },
-{NULL, '3', CMD_PRM, NULL,   dial_handler },
-{NULL, '4', CMD_PRM, NULL,   dial_handler },
-{NULL, '5', CMD_PRM, NULL,   dial_handler },
-{NULL, '6', CMD_PRM, NULL,   dial_handler },
-{NULL, '7', CMD_PRM, NULL,   dial_handler },
-{NULL, '8', CMD_PRM, NULL,   dial_handler },
-{NULL, '9', CMD_PRM, NULL,   dial_handler },
-};
-
-
-static int call_audio_debug(struct re_printf *pf, void *unused)
-{
-    (void)unused;
-    return audio_debug(pf, call_audio(ua_call(uag_cur())));
-}
-
-
-static int call_audioenc_cycle(struct re_printf *pf, void *unused)
-{
-    (void)pf;
-    (void)unused;
-    audio_encoder_cycle(call_audio(ua_call(uag_cur())));
-    return 0;
-}
-
-
-static int call_reinvite(struct re_printf *pf, void *unused)
-{
-    (void)pf;
-    (void)unused;
-    return call_modify(ua_call(uag_cur()));
-}
-
-
-static int call_mute(struct re_printf *pf, void *unused)
-{
-    struct audio *audio = call_audio(ua_call(uag_cur()));
-    bool muted = !audio_ismuted(audio);
-    (void)unused;
-
-    (void)re_hprintf(pf, "\ncall %smuted\n", muted ? "" : "un-");
-    audio_mute(audio, muted);
-
-    return 0;
-}
-
-
 static int call_xfer(struct re_printf *pf, void *arg)
 {
     const struct cmd_arg *carg = arg;
@@ -524,411 +131,21 @@ static int call_xfer(struct re_printf *pf, void *arg)
     return 0;
 }
 
-
-static int cmd_call_hold(struct re_printf *pf, void *arg)
+static void mqtt_send_message(const char *msg)
 {
-    (void)pf;
-    (void)arg;
+    int ret = MQTTClient_isConnected(mqtt.client);
 
-    return call_hold(ua_call(uag_cur()), true);
-}
-
-
-static int cmd_call_resume(struct re_printf *pf, void *arg)
-{
-    (void)pf;
-    (void)arg;
-
-    return call_hold(ua_call(uag_cur()), false);
-}
-
-
-static int hold_prev_call(struct re_printf *pf, void *arg)
-{
-    const struct cmd_arg *carg = arg;
-    (void)pf;
-
-    return call_hold(ua_prev_call(uag_cur()), 'H' == carg->key);
-}
-
-
-static int switch_audio_player(struct re_printf *pf, void *arg)
-{
-    const struct cmd_arg *carg = arg;
-    struct pl pl_driver, pl_device;
-    struct config_audio *aucfg;
-    struct config *cfg;
-    struct audio *a;
-    struct le *le;
-    char driver[16], device[128] = "";
-    int err = 0;
-
-    static bool switch_aud_inprogress;
-
-    if (!switch_aud_inprogress && !carg->complete) {
-        re_hprintf(pf,
-               "\rPlease enter audio device (driver,device)\n");
+    if (1 == ret) {
+        info("*** mqtt: %s\n", msg);
+    } else {
+        info("*** mqtt: connection failed!\n");
     }
-
-    switch_aud_inprogress = true;
-
-    if (carg->complete) {
-
-        switch_aud_inprogress = false;
-
-        if (re_regex(carg->prm, str_len(carg->prm), "[^,]+,[~]*",
-                 &pl_driver, &pl_device)) {
-
-            return re_hprintf(pf, "\rFormat should be:"
-                      " driver,device\n");
-        }
-
-        pl_strcpy(&pl_driver, driver, sizeof(driver));
-        pl_strcpy(&pl_device, device, sizeof(device));
-
-        if (!auplay_find(driver)) {
-            re_hprintf(pf, "no such audio-player: %s\n", driver);
-            return 0;
-        }
-
-        re_hprintf(pf, "switch audio player: %s,%s\n",
-               driver, device);
-
-        cfg = conf_config();
-        if (!cfg) {
-            return re_hprintf(pf, "no config object\n");
-        }
-
-        aucfg = &cfg->audio;
-
-        str_ncpy(aucfg->play_mod, driver, sizeof(aucfg->play_mod));
-        str_ncpy(aucfg->play_dev, device, sizeof(aucfg->play_dev));
-
-        str_ncpy(aucfg->alert_mod, driver, sizeof(aucfg->alert_mod));
-        str_ncpy(aucfg->alert_dev, device, sizeof(aucfg->alert_dev));
-
-        for (le = list_tail(ua_calls(uag_cur())); le; le = le->prev) {
-
-            struct call *call = le->data;
-
-            a = call_audio(call);
-
-            err = audio_set_player(a, driver, device);
-            if (err) {
-                re_hprintf(pf, "failed to set audio-player"
-                       " (%m)\n", err);
-                break;
-            }
-        }
-    }
-
-    return 0;
-}
-
-
-static int switch_audio_source(struct re_printf *pf, void *arg)
-{
-    const struct cmd_arg *carg = arg;
-    struct pl pl_driver, pl_device;
-    struct config_audio *aucfg;
-    struct config *cfg;
-    struct audio *a;
-    struct le *le;
-    char driver[16], device[128] = "";
-    int err = 0;
-
-    static bool switch_aud_inprogress;
-
-    if (!switch_aud_inprogress && !carg->complete) {
-        re_hprintf(pf,
-               "\rPlease enter audio device (driver,device)\n");
-    }
-
-    switch_aud_inprogress = true;
-
-    if (carg->complete) {
-
-        switch_aud_inprogress = false;
-
-        if (re_regex(carg->prm, str_len(carg->prm), "[^,]+,[~]*",
-                 &pl_driver, &pl_device)) {
-
-            return re_hprintf(pf, "\rFormat should be:"
-                      " driver,device\n");
-        }
-
-        pl_strcpy(&pl_driver, driver, sizeof(driver));
-        pl_strcpy(&pl_device, device, sizeof(device));
-
-        if (!ausrc_find(driver)) {
-            re_hprintf(pf, "no such audio-source: %s\n", driver);
-            return 0;
-        }
-
-        re_hprintf(pf, "switch audio device: %s,%s\n",
-               driver, device);
-
-        cfg = conf_config();
-        if (!cfg) {
-            return re_hprintf(pf, "no config object\n");
-        }
-
-        aucfg = &cfg->audio;
-
-        str_ncpy(aucfg->src_mod, driver, sizeof(aucfg->src_mod));
-        str_ncpy(aucfg->src_dev, device, sizeof(aucfg->src_dev));
-
-        for (le = list_tail(ua_calls(uag_cur())); le; le = le->prev) {
-
-            struct call *call = le->data;
-
-            a = call_audio(call);
-
-            err = audio_set_source(a, driver, device);
-            if (err) {
-                re_hprintf(pf, "failed to set audio-source"
-                       " (%m)\n", err);
-                break;
-            }
-        }
-    }
-
-    return 0;
-}
-
-
-#ifdef USE_VIDEO
-static int call_videoenc_cycle(struct re_printf *pf, void *unused)
-{
-    (void)pf;
-    (void)unused;
-    video_encoder_cycle(call_video(ua_call(uag_cur())));
-    return 0;
-}
-
-
-static int call_video_debug(struct re_printf *pf, void *unused)
-{
-    (void)unused;
-    return video_debug(pf, call_video(ua_call(uag_cur())));
-}
-#endif
-
-
-static int digit_handler(struct re_printf *pf, void *arg)
-{
-    const struct cmd_arg *carg = arg;
-    struct call *call;
-    int err = 0;
-
-    (void)pf;
-
-    call = ua_call(uag_cur());
-    if (call)
-        err = call_send_digit(call, carg->key);
-
-    return err;
-}
-
-
-static int toggle_statmode(struct re_printf *pf, void *arg)
-{
-    (void)pf;
-    (void)arg;
-
-    if (statmode == STATMODE_OFF)
-        statmode = STATMODE_CALL;
-    else
-        statmode = STATMODE_OFF;
-
-    return 0;
-}
-
-
-static int set_current_call(struct re_printf *pf, void *arg)
-{
-    struct cmd_arg *carg = arg;
-    struct call *call;
-    uint32_t linenum = atoi(carg->prm);
-    int err;
-
-    call = call_find_linenum(ua_calls(uag_cur()), linenum);
-    if (call) {
-        err = re_hprintf(pf, "setting current call: line %u\n",
-                 linenum);
-        call_set_current(ua_calls(uag_cur()), call);
-    }
-    else {
-        err = re_hprintf(pf, "call not found\n");
-    }
-
-    return err;
-}
-
-#if 0
-static const struct cmd callcmdv[] = {
-{"reinvite",  'I',        0, "Send re-INVITE",      call_reinvite         },
-{"resume",    'X',        0, "Call resume",         cmd_call_resume       },
-{"audio_debug",'A',       0, "Audio stream",        call_audio_debug      },
-{"audio_cycle",'e',       0, "Cycle audio encoder", call_audioenc_cycle   },
-{"mute",      'm',        0, "Call mute/un-mute",   call_mute             },
-{"transfer",  't', CMD_IPRM, "Transfer call",       call_xfer             },
-{"hold",      'x',        0, "Call hold",           cmd_call_hold         },
-{"",          'H',        0, "Hold previous call",  hold_prev_call        },
-{"",          'L',        0, "Resume previous call",hold_prev_call        },
-
-#ifdef USE_VIDEO
-{"video_cycle", 'E',      0, "Cycle video encoder", call_videoenc_cycle   },
-{"video_debug", 'V',      0, "Video stream",        call_video_debug      },
-#endif
-
-/* Numeric keypad for DTMF events: */
-{NULL, '#',         0, NULL,                  digit_handler         },
-{NULL, '*',         0, NULL,                  digit_handler         },
-{NULL, '0',         0, NULL,                  digit_handler         },
-{NULL, '1',         0, NULL,                  digit_handler         },
-{NULL, '2',         0, NULL,                  digit_handler         },
-{NULL, '3',         0, NULL,                  digit_handler         },
-{NULL, '4',         0, NULL,                  digit_handler         },
-{NULL, '5',         0, NULL,                  digit_handler         },
-{NULL, '6',         0, NULL,                  digit_handler         },
-{NULL, '7',         0, NULL,                  digit_handler         },
-{NULL, '8',         0, NULL,                  digit_handler         },
-{NULL, '9',         0, NULL,                  digit_handler         },
-{NULL, KEYCODE_REL, 0, NULL,                  digit_handler         },
-
-{NULL,  'S',        0, "Statusmode toggle",       toggle_statmode   },
-{"line",'@',  CMD_PRM, "Set current call <line>", set_current_call  },
-};
-#endif
-
-static int menu_set_incall(bool incall)
-{
-    struct commands *commands = baresip_commands();
-    int err = 0;
-#if 0
-    /* Dynamic menus */
-    if (incall) {
-        cmd_unregister(commands, dialcmdv);
-
-        if (!cmds_find(commands, callcmdv)) {
-            err = cmd_register(commands,
-                       callcmdv, ARRAY_SIZE(callcmdv));
-        }
-    }
-    else {
-        cmd_unregister(commands, callcmdv);
-
-        if (!cmds_find(commands, dialcmdv)) {
-            err = cmd_register(baresip_commands(), dialcmdv,
-                       ARRAY_SIZE(dialcmdv));
-        }
-    }
-    if (err) {
-        warning("menu: set_incall: cmd_register failed (%m)\n", err);
-    }
-#endif
-
-    return err;
-}
-
-
-static void tmrstat_handler(void *arg)
-{
-    struct call *call;
-    (void)arg;
-
-    /* the UI will only show the current active call */
-    call = ua_call(uag_cur());
-    if (!call)
-        return;
-
-    tmr_start(&tmr_stat, 100, tmrstat_handler, 0);
-
-    if (ui_isediting())
-        return;
-
-    if (STATMODE_OFF != statmode) {
-        (void)re_fprintf(stderr, "%H\r", call_status, call);
-    }
-}
-
-
-static void update_callstatus(void)
-{
-    /* if there are any active calls, enable the call status view */
-    if (have_active_calls())
-        tmr_start(&tmr_stat, 100, tmrstat_handler, 0);
-    else
-        tmr_cancel(&tmr_stat);
-}
-
-
-static void alert_start(void *arg)
-{
-    (void)arg;
-
-    if (!mqtt.bell)
-        return;
-
-    ui_output("\033[10;1000]\033[11;1000]\a");
-
-    tmr_start(&tmr_alert, 1000, alert_start, NULL);
-}
-
-
-static void alert_stop(void)
-{
-    if (!mqtt.bell)
-        return;
-
-    if (tmr_isrunning(&tmr_alert))
-        ui_output("\r");
-
-    tmr_cancel(&tmr_alert);
-}
-
-
-static void redial_handler(void *arg)
-{
-    char *uri = NULL;
-    int err;
-    (void)arg;
-
-    info("now: redialing now. current_attempts=%u, max_attempts=%u\n",
-         mqtt.current_attempts,
-         mqtt.redial_attempts);
-
-    if (mqtt.current_attempts > mqtt.redial_attempts) {
-
-        info("menu: redial: too many attemptes -- giving up\n");
-        return;
-    }
-
-    if (dialbuf->end == 0) {
-        warning("menu: redial: dialbuf is empty\n");
-        return;
-    }
-
-    dialbuf->pos = 0;
-    err = mbuf_strdup(dialbuf, &uri, dialbuf->end);
-    if (err)
-        return;
-
-    err = ua_connect(uag_cur(), NULL, NULL, uri, NULL, VIDMODE_ON);
-    if (err) {
-        warning("menu: redial: ua_connect failed (%m)\n", err);
-    }
-
-    mem_deref(uri);
-
 }
 
 static void ua_event_handler(struct ua *ua, enum ua_event ev,
                  struct call *call, const char *prm, void *arg)
 {
     struct player *player = baresip_player();
-    int err;
     struct cmd_ctx *ctx = 0;
     struct commands *commands = baresip_commands();
 
@@ -939,11 +156,12 @@ static void ua_event_handler(struct ua *ua, enum ua_event ev,
     switch (ev) {
 
     case UA_EVENT_CALL_INCOMING:
+        mqtt_send_message("incoming call");
 
         /* set the current User-Agent to the one with the call */
         uag_current_set(ua);
 
-        info("%s: Incoming call from: %s %s -"
+        info("*** %s: Incoming call from: %s %s -"
              " (press 'a' to accept)\n",
              ua_aor(ua), call_peername(call), call_peeruri(call));
 
@@ -964,15 +182,12 @@ static void ua_event_handler(struct ua *ua, enum ua_event ev,
                 (void)play_file(&mqtt.play, player,
                         "ring.wav", -1);
             }
-
-            if (mqtt.bell)
-                alert_start(0);
         }
 
         break;
 
     case UA_EVENT_CALL_RINGING:
-        printf("*** Ringing...\n");
+        mqtt_send_message("bell is ringing");
         /* stop any ringtones */
         mqtt.play = mem_deref(mqtt.play);
 
@@ -980,19 +195,15 @@ static void ua_event_handler(struct ua *ua, enum ua_event ev,
         break;
 
     case UA_EVENT_CALL_ESTABLISHED:
-        printf("*** Established...\n");
+        mqtt_send_message("connection established");
         /* stop any ringtones */
         mqtt.play = mem_deref(mqtt.play);
-
-        alert_stop();
-
-        /* We must stop the re-dialing if the call was
-           established */
-        redial_reset();
         break;
 
     case UA_EVENT_CALL_CLOSED:
         /* stop any ringtones */
+        mqtt_send_message("connection closed");
+
         mqtt.play = mem_deref(mqtt.play);
 
         if (call_scode(call)) {
@@ -1003,85 +214,109 @@ static void ua_event_handler(struct ua *ua, enum ua_event ev,
                         tone, 1);
             }
         }
-
-        alert_stop();
-
-        /* Activate the re-dialing if:
-         *
-         * - redial_attempts must be enabled in config
-         * - the closed call must be of outgoing direction
-         * - the closed call must fail with special code 701
-         */
-        if (mqtt.redial_attempts) {
-
-            if (mqtt.current_attempts
-                ||
-                (call_is_outgoing(call) &&
-                 call_scode(call) == 701)) {
-
-                info("menu: call closed"
-                     " -- redialing in %u seconds\n",
-                     mqtt.redial_delay);
-
-                ++mqtt.current_attempts;
-
-                tmr_start(&mqtt.tmr_redial,
-                      mqtt.redial_delay*1000,
-                      redial_handler, NULL);
-            }
-            else {
-                info("menu: call closed -- not redialing\n");
-            }
-        }
-
         break;
 
     case UA_EVENT_REGISTER_OK:
+        mqtt_send_message("registration: OK");
         check_registrations();
         break;
 
     case UA_EVENT_UNREGISTERING:
+        mqtt_send_message("unregistration: OK");
         return;
 
     default:
         break;
     }
-
-    menu_set_incall(have_active_calls());
-    update_callstatus();
 }
 
 static void mqueue_handler(int id, void *data, void *arg)
 {
     switch ((enum module_events)id) {
-    case MQ_HANGUP:
-        printf("*** Hanging UP!\n");
-        usleep(10);
-        cmd_hangup(NULL, NULL);
+    case MQ_ANSWER: 
+        {
+            struct ua *ua = uag_cur();
+
+            info ("Answering incoming call: %s\n", ua_aor(ua));
+
+            /* Stop any ongoing ring-tones */
+            mqtt.play = mem_deref(mqtt.play);
+
+            ua_hold_answer(ua, NULL);
+        }
         break;
+
+    case MQ_HANGUP:
+        {
+            mqtt_send_message("{\"event\":\"hangup\"}");
+            usleep(10);
+
+            /* Stop any ongoing ring-tones */
+            mqtt.play = mem_deref(mqtt.play);
+
+            ua_hangup(uag_cur(), NULL, 0, NULL);
+        }
+        break;
+
     case MQ_CONNECT:
         {
+            //mqtt_send_message("{\"event\":\"connected\"}");
             const char *uri = (const char *) data;
+            printf("URL is: %s\n", uri);
             ua_connect(uag_cur(), NULL, NULL, uri, NULL, VIDMODE_OFF);
         }
         break;
-#if 0
-    case MQ_CLOSE:
-        if (!win->closed) {
-            ua_hangup(uag_current(), win->call, 0, NULL);
-            win->closed = true;
+    
+    case MQ_MUTE:
+        {
+            struct audio *audio = call_audio(ua_call(uag_cur()));        
+            audio_mute(audio, true);
+            mqtt_send_message("{\"event\":\"muted\"}");
         }
-        mem_deref(win);
         break;
 
-    case MQ_MUTE:
-        audio_mute(call_audio(win->call), (size_t)data);
+    case MQ_UNMUTE:
+        {
+            struct audio *audio = call_audio(ua_call(uag_cur()));        
+            audio_mute(audio, false);
+            mqtt_send_message("{\"event\":\"unmuted\"}");
+        }
         break;
 
     case MQ_HOLD:
-        call_hold(win->call, (size_t)data);
+        {
+            int ret = call_hold(ua_call(uag_cur()), true);
+            info("Hold result: %d\n", ret);
+        }
         break;
 
+    case MQ_RESUME:
+        {
+            int ret = call_hold(ua_call(uag_cur()), false);
+            info("unhold result: %d\n", ret);
+        }
+        break;
+
+    case MQ_CALL_STATUS:
+        {
+            int status = ua_call(uag_cur());
+            if (status)
+                mqtt_send_message("{\"active_call\":\"yes\"}");
+            else
+                mqtt_send_message("{\"active_call\":\"no\"}");
+        }
+        break;
+
+    case MQ_REGISTRATION_STATUS:
+        {
+            int status = list_count(uag_list());
+            if (status)
+                mqtt_send_message("{\"registered\":\"yes\"}");
+            else
+                mqtt_send_message("{\"registered\":\"no\"}");
+        }
+        break;
+#if 0
     case MQ_TRANSFER:
         call_transfer(win->call, data);
         break;
@@ -1103,10 +338,11 @@ static void message_handler(const struct pl *peer, const struct pl *ctype,
 
 static int mqtt_message_arrived(void *context, char *topicName, int topicLen, MQTTClient_message *message)
 {
-    printf("Topic Name: %s\n", topicName);
+    char *str = 0;
+    //printf("Topic Name: %s\n", topicName);
 
-    if (!strcmp(topicName, "baresip/read")) {
-        char *str = (char*) calloc(1, message->payloadlen + 1);
+    if (!strncmp(topicName, "baresip/read", topicLen)) {
+        str = (char *) calloc(1, message->payloadlen + 1);
         if (!str) return 0;
 
         memcpy(str, message->payload, message->payloadlen);
@@ -1118,19 +354,48 @@ static int mqtt_message_arrived(void *context, char *topicName, int topicLen, MQ
             info("current command is: %d\n", cmd);
 
             switch (cmd) {
+            case 'a':
+                mqueue_push(mqtt.mq, MQ_ANSWER, NULL);
+                break;
             case 'b':
                 mqueue_push(mqtt.mq, MQ_HANGUP, NULL);
                 break;
             case 'd':
                 {
-                    char *arg = cJSON_GetObjectItem(json, "account")->valuestring;
-                    if (arg) {
-                        info("mqtt: connecting to %s\n", arg);
-                        mqueue_push(mqtt.mq, MQ_CONNECT, arg);
+                    cJSON *item = cJSON_GetObjectItem(json, "account");
+                    if (NULL != item) {
+                        if (item->valuestring && item->valuestring[0] != '\0') {
+                            char *arg = (char *) malloc(32);
+                            strcpy(arg, item->valuestring);
+                            info("mqtt: connecting to %s\n", arg);
+                            mqueue_push(mqtt.mq, MQ_CONNECT, arg);
+                        }
                     } else {
                         info("mqtt: no account is specified for the call.\n");
                     }
                 }
+                break;
+            case 'u':
+                mqueue_push(mqtt.mq, MQ_UNMUTE, NULL);
+                mqtt_send_message("audio unmuted");
+                break;
+            case 'm': 
+                mqueue_push(mqtt.mq, MQ_MUTE, NULL);;
+                mqtt_send_message("audio muted");
+                break;
+            case 'h': 
+                mqueue_push(mqtt.mq, MQ_HOLD, NULL);;
+                break;
+            case 'r': 
+                mqueue_push(mqtt.mq, MQ_RESUME, NULL);;
+                break;
+            case 's':
+                /* call status */
+                mqueue_push(mqtt.mq, MQ_CALL_STATUS, NULL);
+                break;
+            case 'p':
+                /* registration status */
+                mqueue_push(mqtt.mq, MQ_REGISTRATION_STATUS, NULL);            
                 break;
             default:
                 info("mqtt: message not recognized!\n");
@@ -1138,14 +403,11 @@ static int mqtt_message_arrived(void *context, char *topicName, int topicLen, MQ
         } else {
             info("mqtt: invalid command!\n");
         }
-
-        free(str);
     }
-
-    info("Quitting mqtt_message_arrived...\n");
 
     MQTTClient_freeMessage(&message);
     MQTTClient_free(topicName);
+    free(str);
 
     return 1;
 }
@@ -1162,19 +424,7 @@ static int module_init(void)
     int err;
     MQTTClient_connectOptions connection_options = MQTTClient_connectOptions_initializer;
 
-    (void) call_reinvite;
-    (void) cmd_call_resume;
-    (void) call_audio_debug;
-    (void) call_audioenc_cycle;
-    (void) call_mute;
     (void) call_xfer;
-    (void) cmd_call_hold;
-    (void) hold_prev_call;
-    (void) hold_prev_call;
-#ifdef USE_VIDEO
-    (void) call_videoenc_cycle;
-    (void) call_video_debug;
-#endif
 
     printf("Initializing module mqtt!\n");
 
@@ -1182,43 +432,7 @@ static int module_init(void)
     if (err)
         return err;
 
-    /*
-     * Read the config values
-     */
-    conf_get_bool(conf_cur(), "menu_bell", &mqtt.bell);
-
-    if (0 == conf_get(conf_cur(), "redial_attempts", &val) &&
-        0 == pl_strcasecmp(&val, "inf")) {
-        mqtt.redial_attempts = (uint32_t)-1;
-    }
-    else {
-        conf_get_u32(conf_cur(), "redial_attempts",
-                 &mqtt.redial_attempts);
-    }
-    conf_get_u32(conf_cur(), "redial_delay", &mqtt.redial_delay);
-
-    if (mqtt.redial_attempts) {
-        info("menu: redial enabled with %u attempts and"
-             " %u seconds delay\n",
-             mqtt.redial_attempts,
-             mqtt.redial_delay);
-    }
-
-    dialbuf = mbuf_alloc(64);
-    if (!dialbuf)
-        return ENOMEM;
-
-    start_ticks = tmr_jiffies();
-    tmr_init(&tmr_alert);
     statmode = STATMODE_CALL;
-#if 0
-    err  = cmd_register(baresip_commands(), cmdv, ARRAY_SIZE(cmdv));
-    err |= cmd_register(baresip_commands(), dialcmdv,
-                ARRAY_SIZE(dialcmdv));
-#endif
-
-    if (err)
-        return err;
 
     err |= uag_event_register(ua_event_handler, NULL);
     err |= message_init(message_handler, NULL);
@@ -1250,21 +464,8 @@ static int module_close(void)
 
     message_close();
     uag_event_unregister(ua_event_handler);
-#if 0
-    cmd_unregister(baresip_commands(), cmdv);
-    cmd_unregister(baresip_commands(), dialcmdv);
-    cmd_unregister(baresip_commands(), callcmdv);
-#endif
-
-    tmr_cancel(&tmr_alert);
-    tmr_cancel(&tmr_stat);
-    dialbuf = mem_deref(dialbuf);
-
-    le_cur = NULL;
 
     mqtt.play = mem_deref(mqtt.play);
-
-    tmr_cancel(&mqtt.tmr_redial);
 
     return 0;
 }
