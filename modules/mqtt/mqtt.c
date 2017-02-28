@@ -13,7 +13,6 @@
 
 #include <MQTTClient.h>
 #include <cjson/cJSON.h>
-#include <cjson/cJSON_Utils.h>
 
 /**
  * @defgroup mqtt mqtt
